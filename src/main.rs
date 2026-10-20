@@ -23,13 +23,13 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     FindWindowW, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetDesktopWindow,
-    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowRect, IsIconic, IsWindowVisible,
-    LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer,
-    SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, GA_ROOT, IDC_ARROW, IDC_HAND,
-    LWA_COLORKEY, MF_STRING, MSG, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNA, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP, WS_VISIBLE,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, IsWindowVisible, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor,
+    SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu,
+    TranslateMessage, GA_ROOT, IDC_ARROW, IDC_HAND, LWA_COLORKEY, MF_STRING, MSG, SWP_NOACTIVATE,
+    SW_HIDE, SW_SHOWNA, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
 #[link(name = "user32")]
@@ -44,8 +44,7 @@ extern "system" {
 
 const VK_LBUTTON: i32 = 0x01;
 
-// Notification states indicating fullscreen apps/games
-const QUNS_BUSY: i32 = 2;
+// Notification states indicating exclusive fullscreen games / presentations
 const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
 const QUNS_PRESENTATION_MODE: i32 = 4;
 
@@ -56,7 +55,7 @@ const PADDING: i32 = 0;
 const TIMER_ID: usize = 1;
 const HWND_TOPMOST: HWND = HWND(-1isize as *mut _);
 
-// Color Key: 100% transparent across the entire taskbar (no black squares)
+// Color Key: 100% transparent across the entire taskbar
 const TRANSPARENT_COLOR_KEY: u32 = 0x00050505;
 
 // Colors matching Windows 11 Taskbar
@@ -82,7 +81,6 @@ fn start_mouse_tracker(hwnd: HWND) {
         loop {
             std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS polling
 
-            // Do not intercept mouse clicks or highlight if the switcher is hidden
             if !unsafe { IsWindowVisible(hwnd).as_bool() } {
                 if HOVERED_INDEX.swap(-1, Ordering::Relaxed) != -1 {
                     unsafe {
@@ -126,14 +124,12 @@ fn start_mouse_tracker(hwnd: HWND) {
                 }
             }
 
-            // Update hover box
             if HOVERED_INDEX.swap(new_hover, Ordering::Relaxed) != new_hover {
                 unsafe {
                     let _ = InvalidateRect(hwnd, None, BOOL(0));
                 }
             }
 
-            // Intercept clicks anywhere inside the full button box
             let is_pressed = unsafe { GetAsyncKeyState(VK_LBUTTON) } < 0;
             if is_pressed && !was_pressed {
                 if let Some(ws_id) = hit_ws_id {
@@ -152,6 +148,7 @@ fn start_mouse_tracker(hwnd: HWND) {
 
                     if should_switch {
                         unsafe {
+                            dock_to_taskbar(hwnd);
                             let _ = InvalidateRect(hwnd, None, BOOL(0));
                         }
                         switch_to_workspace(ws_id);
@@ -165,18 +162,7 @@ fn start_mouse_tracker(hwnd: HWND) {
 
 /// Determines if the taskbar is currently visible on the monitor hosting `our_hwnd`.
 pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
-    // 1. Direct Shell Check for Fullscreen Games / Presentations / Fullscreen Apps
-    let mut notification_state: i32 = 0;
-    if SHQueryUserNotificationState(&mut notification_state) == 0 {
-        if notification_state == QUNS_BUSY
-            || notification_state == QUNS_RUNNING_D3D_FULL_SCREEN
-            || notification_state == QUNS_PRESENTATION_MODE
-        {
-            return false;
-        }
-    }
-
-    // 2. Locate the taskbar window
+    // 1. Locate the taskbar window
     let taskbar = match FindWindowW(w!("Shell_TrayWnd"), None) {
         Ok(h) if !h.is_invalid() && h.0 as usize != 0 => h,
         _ => return false,
@@ -186,29 +172,27 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
         return false;
     }
 
-    // 3. Identify the monitor hosting our switcher
-    let hmon = MonitorFromWindow(our_hwnd, MONITOR_DEFAULTTONEAREST);
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+    // 2. Auto-hide check: verify whether the taskbar is currently retracted
+    let mut tb_rect = RECT::default();
+    if GetWindowRect(taskbar, &mut tb_rect).is_ok() {
+        if (tb_rect.bottom - tb_rect.top) <= 4 || (tb_rect.right - tb_rect.left) <= 4 {
+            return false;
+        }
+    } else {
         return false;
     }
 
-    // 4. Auto-hide check: verify whether the taskbar is currently retracted
-    let mut tb_rect = RECT::default();
-    if GetWindowRect(taskbar, &mut tb_rect).is_ok() {
-        let visible_height = (tb_rect.bottom.min(mi.rcMonitor.bottom) - tb_rect.top.max(mi.rcMonitor.top)).max(0);
-        let visible_width = (tb_rect.right.min(mi.rcMonitor.right) - tb_rect.left.max(mi.rcMonitor.left)).max(0);
-
-        // When retracted, Windows leaves <= 4 pixels of edge detection area
-        if visible_height <= 4 || visible_width <= 4 {
+    // 3. Direct Shell Check for Exclusive Fullscreen 3D Games and Presentations
+    let mut notification_state: i32 = 0;
+    if SHQueryUserNotificationState(&mut notification_state) == 0 {
+        if notification_state == QUNS_RUNNING_D3D_FULL_SCREEN
+            || notification_state == QUNS_PRESENTATION_MODE
+        {
             return false;
         }
     }
 
-    // 5. Fallback fullscreen check: inspect root ancestor of the active foreground window
+    // 4. Check for active borderless/fullscreen user applications (e.g. YouTube, VLC, Games)
     let fg_hwnd = GetForegroundWindow();
     if !fg_hwnd.is_invalid() && fg_hwnd.0 as usize != 0 {
         let root_fg = GetAncestor(fg_hwnd, GA_ROOT);
@@ -217,20 +201,45 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
 
         if root_fg != our_hwnd && root_fg != taskbar && root_fg != desktop && root_fg != shell {
             if !IsIconic(root_fg).as_bool() && IsWindowVisible(root_fg).as_bool() {
-                let mut class_buf = [0u16; 64];
-                let len = GetClassNameW(root_fg, &mut class_buf);
-                let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+                // If the foreground window belongs to explorer (tray, desktop, flyouts), it's not a fullscreen app
+                let mut shell_pid: u32 = 0;
+                let mut fg_pid: u32 = 0;
+                GetWindowThreadProcessId(taskbar, Some(&mut shell_pid));
+                GetWindowThreadProcessId(root_fg, Some(&mut fg_pid));
 
-                if class_name != "Progman" && class_name != "WorkerW" {
-                    let mut fg_rect = RECT::default();
-                    if GetWindowRect(root_fg, &mut fg_rect).is_ok() {
-                        let tol = 10; // Allow 10px tolerance for window borders and DPI scaling
-                        if fg_rect.left <= mi.rcMonitor.left + tol
-                            && fg_rect.top <= mi.rcMonitor.top + tol
-                            && fg_rect.right >= mi.rcMonitor.right - tol
-                            && fg_rect.bottom >= mi.rcMonitor.bottom - tol
-                        {
-                            return false;
+                if fg_pid != 0 && fg_pid != shell_pid {
+                    let mut class_buf = [0u16; 64];
+                    let len = GetClassNameW(root_fg, &mut class_buf);
+                    let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
+
+                    // Exclude Windows Shell / UWP flyouts (Start menu, Search, Quick Settings, etc.)
+                    let is_shell_ui = class_name.starts_with("Windows.UI.")
+                        || class_name.starts_with("Xaml")
+                        || class_name == "Progman"
+                        || class_name == "WorkerW"
+                        || class_name == "NotifyIconOverflowWindow"
+                        || class_name == "TrayFlyoutWClass"
+                        || class_name == "Shell_InputSwitchTopLevelWindow";
+
+                    if !is_shell_ui {
+                        let hmon = MonitorFromWindow(our_hwnd, MONITOR_DEFAULTTONEAREST);
+                        let mut mi = MONITORINFO {
+                            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                            ..Default::default()
+                        };
+
+                        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                            let mut fg_rect = RECT::default();
+                            if GetWindowRect(root_fg, &mut fg_rect).is_ok() {
+                                // A true fullscreen window covers the entire monitor rect
+                                if fg_rect.left <= mi.rcMonitor.left
+                                    && fg_rect.top <= mi.rcMonitor.top
+                                    && fg_rect.right >= mi.rcMonitor.right
+                                    && fg_rect.bottom >= mi.rcMonitor.bottom
+                                {
+                                    return false;
+                                }
+                            }
                         }
                     }
                 }
@@ -325,7 +334,15 @@ unsafe extern "system" fn wndproc(
                     let old_p = SelectObject(mem_dc, hover_pen);
                     let old_b = SelectObject(mem_dc, hover_brush);
 
-                    let _ = RoundRect(mem_dc, btn_rect.left, btn_rect.top, btn_rect.right, btn_rect.bottom, 6, 6);
+                    let _ = RoundRect(
+                        mem_dc,
+                        btn_rect.left,
+                        btn_rect.top,
+                        btn_rect.right,
+                        btn_rect.bottom,
+                        6,
+                        6,
+                    );
 
                     let _ = SelectObject(mem_dc, old_p);
                     let _ = SelectObject(mem_dc, old_b);
@@ -342,7 +359,13 @@ unsafe extern "system" fn wndproc(
                 };
 
                 SetTextColor(mem_dc, text_color);
-                let chosen_font = if ws.is_active { font_active } else if ws.has_windows { font_busy } else { font_normal };
+                let chosen_font = if ws.is_active {
+                    font_active
+                } else if ws.has_windows {
+                    font_busy
+                } else {
+                    font_normal
+                };
                 let old_font = SelectObject(mem_dc, chosen_font);
 
                 let mut label: Vec<u16> = format!("{}", ws.id).encode_utf16().collect();
@@ -366,7 +389,15 @@ unsafe extern "system" fn wndproc(
                     let old_p = SelectObject(mem_dc, null_pen);
                     let old_b = SelectObject(mem_dc, brush);
 
-                    let _ = RoundRect(mem_dc, bar_left, bar_top, bar_left + bar_w, bar_top + bar_h, 3, 3);
+                    let _ = RoundRect(
+                        mem_dc,
+                        bar_left,
+                        bar_top,
+                        bar_left + bar_w,
+                        bar_top + bar_h,
+                        3,
+                        3,
+                    );
 
                     let _ = SelectObject(mem_dc, old_b);
                     let _ = SelectObject(mem_dc, old_p);
@@ -381,7 +412,15 @@ unsafe extern "system" fn wndproc(
                     let old_p = SelectObject(mem_dc, null_pen);
                     let old_b = SelectObject(mem_dc, brush);
 
-                    let _ = RoundRect(mem_dc, dot_left, dot_top, dot_left + dot_w, dot_top + dot_h, 3, 3);
+                    let _ = RoundRect(
+                        mem_dc,
+                        dot_left,
+                        dot_top,
+                        dot_left + dot_w,
+                        dot_top + dot_h,
+                        3,
+                        3,
+                    );
 
                     let _ = SelectObject(mem_dc, old_b);
                     let _ = SelectObject(mem_dc, old_p);
@@ -439,7 +478,15 @@ unsafe extern "system" fn wndproc(
             let _ = AppendMenuW(menu, MF_STRING, 101, w!("Refresh"));
             let _ = AppendMenuW(menu, MF_STRING, 102, w!("Exit"));
 
-            let cmd = TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, hwnd, None);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                None,
+            );
             let _ = DestroyMenu(menu);
 
             if cmd.0 == 101 {
@@ -482,23 +529,30 @@ unsafe extern "system" fn wndproc(
 }
 
 unsafe fn dock_to_taskbar(hwnd: HWND) {
+    let ws_count = get_state().lock().unwrap().workspaces.len() as i32;
+    if ws_count == 0 {
+        return;
+    }
+
     let taskbar = FindWindowW(w!("Shell_TrayWnd"), None);
     if let Ok(tb_hwnd) = taskbar {
         let mut tb_rect: RECT = zeroed();
         let _ = GetWindowRect(tb_hwnd, &mut tb_rect);
 
-        let tb_height = tb_rect.bottom - tb_rect.top + 2;
+        let tb_height = tb_rect.bottom - tb_rect.top;
+        if tb_height <= 0 {
+            return;
+        }
+
         let btn_size = (tb_height - 6).clamp(18, 32);
         BTN_SIZE.store(btn_size as isize, Ordering::Relaxed);
 
-        let ws_count = get_state().lock().unwrap().workspaces.len() as i32;
         let width = (PADDING * 2) + (ws_count * btn_size) + ((ws_count - 1) * BUTTON_GAP);
         let height = btn_size + (PADDING * 2);
 
         let x = tb_rect.left + TASKBAR_LEFT_MARGIN;
-        let y = tb_rect.top  + (tb_height - height) / 2;
+        let y = tb_rect.top + (tb_height - height) / 2;
 
-        // Note: Using SWP_NOACTIVATE without SWP_SHOWWINDOW so it does NOT undo SW_HIDE
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -514,7 +568,8 @@ unsafe fn dock_to_taskbar(hwnd: HWND) {
 fn main() {
     unsafe {
         let instance = GetModuleHandleW(None).unwrap();
-        let class_name = w!("LeopardSwitchClass");
+
+        let class_name = w!("RAIL_WINDOW");
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -555,7 +610,7 @@ fn main() {
         start_background_poller(hwnd);
         start_subscriber(hwnd);
 
-        // Check visibility state every 250ms (responsive, 0% CPU)
+        // Check visibility state every 250ms
         let _ = SetTimer(hwnd, TIMER_ID, 250, None);
 
         let mut msg: MSG = zeroed();
