@@ -15,28 +15,39 @@ use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, R
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE,
-    DT_VCENTER, FW_BOLD, FW_NORMAL, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TRANSPARENT, 
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, RoundRect, SelectObject, SetBkMode,
+    SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, PS_NULL, PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    FindWindowW, GetClientRect, GetCursorPos, GetMessageW, GetWindowRect, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer,
-    SetWindowPos, TrackPopupMenu, TranslateMessage, IDC_ARROW, IDC_HAND, LWA_COLORKEY, MF_STRING,
-    MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND,
-    WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, GetClassNameW, 
-    GetDesktopWindow, GetForegroundWindow, GetShellWindow, IsIconic, IsWindowVisible, ShowWindow, 
-    SW_HIDE, SW_SHOWNA,
+    FindWindowW, GetAncestor, GetClassNameW, GetClientRect, GetCursorPos, GetDesktopWindow,
+    GetForegroundWindow, GetMessageW, GetShellWindow, GetWindowRect, IsIconic, IsWindowVisible,
+    LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer,
+    SetWindowPos, ShowWindow, TrackPopupMenu, TranslateMessage, GA_ROOT, IDC_ARROW, IDC_HAND,
+    LWA_COLORKEY, MF_STRING, MSG, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNA, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE,
 };
 
 #[link(name = "user32")]
 extern "system" {
     fn GetAsyncKeyState(vkey: i32) -> i16;
 }
+
+#[link(name = "shell32")]
+extern "system" {
+    fn SHQueryUserNotificationState(pquns: *mut i32) -> i32;
+}
+
 const VK_LBUTTON: i32 = 0x01;
+
+// Notification states indicating fullscreen apps/games
+const QUNS_BUSY: i32 = 2;
+const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+const QUNS_PRESENTATION_MODE: i32 = 4;
 
 // Layout Metrics
 const TASKBAR_LEFT_MARGIN: i32 = 8;
@@ -70,6 +81,16 @@ fn start_mouse_tracker(hwnd: HWND) {
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS polling
+
+            // Do not intercept mouse clicks or highlight if the switcher is hidden
+            if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+                if HOVERED_INDEX.swap(-1, Ordering::Relaxed) != -1 {
+                    unsafe {
+                        let _ = InvalidateRect(hwnd, None, BOOL(0));
+                    }
+                }
+                continue;
+            }
 
             let mut win_rect = RECT::default();
             if unsafe { GetWindowRect(hwnd, &mut win_rect) }.is_err() {
@@ -112,7 +133,7 @@ fn start_mouse_tracker(hwnd: HWND) {
                 }
             }
 
-            // Intercept clicks anywhere inside the full 26x26 button box
+            // Intercept clicks anywhere inside the full button box
             let is_pressed = unsafe { GetAsyncKeyState(VK_LBUTTON) } < 0;
             if is_pressed && !was_pressed {
                 if let Some(ws_id) = hit_ws_id {
@@ -143,9 +164,19 @@ fn start_mouse_tracker(hwnd: HWND) {
 }
 
 /// Determines if the taskbar is currently visible on the monitor hosting `our_hwnd`.
-/// Returns `false` if an active window is in fullscreen mode or if the taskbar is retracted.
 pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
-    // 1. Locate the taskbar window
+    // 1. Direct Shell Check for Fullscreen Games / Presentations / Fullscreen Apps
+    let mut notification_state: i32 = 0;
+    if SHQueryUserNotificationState(&mut notification_state) == 0 {
+        if notification_state == QUNS_BUSY
+            || notification_state == QUNS_RUNNING_D3D_FULL_SCREEN
+            || notification_state == QUNS_PRESENTATION_MODE
+        {
+            return false;
+        }
+    }
+
+    // 2. Locate the taskbar window
     let taskbar = match FindWindowW(w!("Shell_TrayWnd"), None) {
         Ok(h) if !h.is_invalid() && h.0 as usize != 0 => h,
         _ => return false,
@@ -155,7 +186,7 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
         return false;
     }
 
-    // 2. Identify the monitor hosting our switcher
+    // 3. Identify the monitor hosting our switcher
     let hmon = MonitorFromWindow(our_hwnd, MONITOR_DEFAULTTONEAREST);
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -165,7 +196,7 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
         return false;
     }
 
-    // 3. Auto-hide check: verify whether the taskbar is currently retracted
+    // 4. Auto-hide check: verify whether the taskbar is currently retracted
     let mut tb_rect = RECT::default();
     if GetWindowRect(taskbar, &mut tb_rect).is_ok() {
         let visible_height = (tb_rect.bottom.min(mi.rcMonitor.bottom) - tb_rect.top.max(mi.rcMonitor.top)).max(0);
@@ -177,28 +208,27 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
         }
     }
 
-    // 4. Fullscreen check: verify if the foreground window covers the screen
+    // 5. Fallback fullscreen check: inspect root ancestor of the active foreground window
     let fg_hwnd = GetForegroundWindow();
     if !fg_hwnd.is_invalid() && fg_hwnd.0 as usize != 0 {
+        let root_fg = GetAncestor(fg_hwnd, GA_ROOT);
         let desktop = GetDesktopWindow();
         let shell = GetShellWindow();
 
-        // Ignore shell surfaces, desktop, and our own switcher window
-        if fg_hwnd != our_hwnd && fg_hwnd != taskbar && fg_hwnd != desktop && fg_hwnd != shell {
-            if !IsIconic(fg_hwnd).as_bool() && IsWindowVisible(fg_hwnd).as_bool() {
+        if root_fg != our_hwnd && root_fg != taskbar && root_fg != desktop && root_fg != shell {
+            if !IsIconic(root_fg).as_bool() && IsWindowVisible(root_fg).as_bool() {
                 let mut class_buf = [0u16; 64];
-                let len = GetClassNameW(fg_hwnd, &mut class_buf);
+                let len = GetClassNameW(root_fg, &mut class_buf);
                 let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
 
-                // Exclude desktop background hosts
                 if class_name != "Progman" && class_name != "WorkerW" {
                     let mut fg_rect = RECT::default();
-                    if GetWindowRect(fg_hwnd, &mut fg_rect).is_ok() {
-                        // A window is fullscreen if it spans or exceeds the entire monitor area
-                        if fg_rect.left <= mi.rcMonitor.left
-                            && fg_rect.top <= mi.rcMonitor.top
-                            && fg_rect.right >= mi.rcMonitor.right
-                            && fg_rect.bottom >= mi.rcMonitor.bottom
+                    if GetWindowRect(root_fg, &mut fg_rect).is_ok() {
+                        let tol = 10; // Allow 10px tolerance for window borders and DPI scaling
+                        if fg_rect.left <= mi.rcMonitor.left + tol
+                            && fg_rect.top <= mi.rcMonitor.top + tol
+                            && fg_rect.right >= mi.rcMonitor.right - tol
+                            && fg_rect.bottom >= mi.rcMonitor.bottom - tol
                         {
                             return false;
                         }
@@ -209,19 +239,6 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
     }
 
     true
-}
-
-/// Toggles the window visibility state without stealing user focus.
-pub unsafe fn update_switcher_visibility(hwnd: HWND) {
-    let should_show = is_taskbar_visible(hwnd);
-    let is_currently_visible = IsWindowVisible(hwnd).as_bool();
-
-    if should_show && !is_currently_visible {
-        // SW_SHOWNA: Show the window *without* activating it or stealing focus
-        let _ = ShowWindow(hwnd, SW_SHOWNA);
-    } else if !should_show && is_currently_visible {
-        let _ = ShowWindow(hwnd, SW_HIDE);
-    }
 }
 
 unsafe extern "system" fn wndproc(
@@ -259,7 +276,6 @@ unsafe extern "system" fn wndproc(
             let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
             let old_bmp = SelectObject(mem_dc, mem_bmp);
 
-            // Fill entire canvas with transparency key (no black boxes anywhere)
             let key_brush = CreateSolidBrush(COLORREF(TRANSPARENT_COLOR_KEY));
             FillRect(mem_dc, &client_rect, key_brush);
             let _ = DeleteObject(key_brush);
@@ -303,7 +319,6 @@ unsafe extern "system" fn wndproc(
 
                 let is_hovered = hovered_idx == i as isize;
 
-                // Draw rounded box ONLY when actively hovered
                 if is_hovered {
                     let hover_brush = CreateSolidBrush(COLOR_HOVER_BG);
                     let hover_pen = CreatePen(PS_SOLID, 1, COLOR_HOVER_BORDER);
@@ -341,7 +356,6 @@ unsafe extern "system" fn wndproc(
                 );
                 let _ = SelectObject(mem_dc, old_font);
 
-                // Indicator Bars
                 if ws.is_active {
                     let bar_w = ((btn_size as f32) * 0.56) as i32;
                     let bar_h = 3;
@@ -438,10 +452,23 @@ unsafe extern "system" fn wndproc(
         }
 
         WM_TIMER => {
-            unsafe {
-                update_switcher_visibility(hwnd);
+            let visible = unsafe { is_taskbar_visible(hwnd) };
+            let is_currently_visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+
+            if visible {
+                dock_to_taskbar(hwnd);
+                if !is_currently_visible {
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_SHOWNA);
+                    }
+                }
+            } else {
+                if is_currently_visible {
+                    unsafe {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                    }
+                }
             }
-            dock_to_taskbar(hwnd);
             LRESULT(0)
         }
 
@@ -471,6 +498,7 @@ unsafe fn dock_to_taskbar(hwnd: HWND) {
         let x = tb_rect.left + TASKBAR_LEFT_MARGIN;
         let y = tb_rect.top  + (tb_height - height) / 2;
 
+        // Note: Using SWP_NOACTIVATE without SWP_SHOWWINDOW so it does NOT undo SW_HIDE
         let _ = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -478,7 +506,7 @@ unsafe fn dock_to_taskbar(hwnd: HWND) {
             y,
             width,
             height,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOACTIVATE,
         );
     }
 }
@@ -521,14 +549,14 @@ fn main() {
 
         fetch_and_update_state();
         dock_to_taskbar(hwnd);
-        update_switcher_visibility(switcher_hwnd);
 
         // Start non-blocking mouse tracker, fast poller & event stream
         start_mouse_tracker(hwnd);
         start_background_poller(hwnd);
         start_subscriber(hwnd);
 
-        let _ = SetTimer(hwnd, TIMER_ID, 1500, None);
+        // Check visibility state every 250ms (responsive, 0% CPU)
+        let _ = SetTimer(hwnd, TIMER_ID, 250, None);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, None, 0, 0).into() {
