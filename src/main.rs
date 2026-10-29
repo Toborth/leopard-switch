@@ -539,7 +539,7 @@ unsafe fn dock_to_taskbar(hwnd: HWND) {
         let mut tb_rect: RECT = zeroed();
         let _ = GetWindowRect(tb_hwnd, &mut tb_rect);
 
-        let tb_height = tb_rect.bottom - tb_rect.top;
+        let tb_height = tb_rect.bottom - tb_rect.top + 2;
         if tb_height <= 0 {
             return;
         }
