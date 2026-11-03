@@ -1,4 +1,5 @@
 use crate::state::{get_state, WorkspaceInfo};
+use crate::IS_SHUTTING_DOWN;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
@@ -22,10 +23,21 @@ pub fn start_background_poller(hwnd: HWND) {
         let mut cycle: u32 = 0;
 
         loop {
+            // 1. Exit immediately if Windows is shutting down
+            if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+                break;
+            }
+
             std::thread::sleep(std::time::Duration::from_millis(60));
+
+            // Check again after waking up from sleep
+            if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+                break;
+            }
+
             cycle += 1;
 
-            // Fast 1ms check for active workspace (instant feel)
+            // Fast check for active workspace
             let mut changed = check_active_workspace_fast();
 
             // Refresh busy dots immediately if an event occurred, or every ~480ms fallback
@@ -36,7 +48,7 @@ pub fn start_background_poller(hwnd: HWND) {
                 }
             }
 
-            if changed {
+            if changed && !IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
                 unsafe {
                     let _ = InvalidateRect(hwnd, None, BOOL(0));
                 }
@@ -47,6 +59,11 @@ pub fn start_background_poller(hwnd: HWND) {
 
 /// Fast check: parses "Active workspace: X" from plain-text output
 pub fn check_active_workspace_fast() -> bool {
+    // Never spawn subprocesses if shutting down
+    if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+        return false;
+    }
+
     let output = Command::new("lwm")
         .args(["query", "workspace"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -75,6 +92,11 @@ pub fn check_active_workspace_fast() -> bool {
 
 /// Query LeopardWM snapshot: parses NDJSON records from `lwm query workspaces`
 pub fn fetch_and_update_state() -> bool {
+    // Never spawn subprocesses if shutting down
+    if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+        return false;
+    }
+
     let output = Command::new("lwm")
         .args(["query", "workspaces"])
         .creation_flags(CREATE_NO_WINDOW)
@@ -147,6 +169,10 @@ pub fn start_subscriber(hwnd: HWND) {
     let hwnd_raw = hwnd.0 as usize;
 
     std::thread::spawn(move || {
+        if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+            return;
+        }
+
         let hwnd = HWND(hwnd_raw as *mut _);
 
         // Subscribing without filters catches layout_changed when windows open, close, or move
@@ -162,7 +188,18 @@ pub fn start_subscriber(hwnd: HWND) {
 
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
-            for line in reader.lines().flatten() {
+            for line_result in reader.lines() {
+                // Terminate subscriber if shutting down
+                if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    break;
+                }
+
+                // If pipe broke (daemon died on shutdown), break out cleanly
+                let Ok(line) = line_result else {
+                    break;
+                };
+
                 let trimmed = line.trim();
                 if trimmed.is_empty() || trimmed == "Subscribed" {
                     continue;
@@ -177,8 +214,10 @@ pub fn start_subscriber(hwnd: HWND) {
                             for w in state.workspaces.iter_mut() {
                                 w.is_active = w.id == new_id;
                             }
-                            unsafe {
-                                let _ = InvalidateRect(hwnd, None, BOOL(0));
+                            if !IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+                                unsafe {
+                                    let _ = InvalidateRect(hwnd, None, BOOL(0));
+                                }
                             }
                         }
                     }
@@ -188,6 +227,9 @@ pub fn start_subscriber(hwnd: HWND) {
                 NEEDS_SNAPSHOT.store(true, Ordering::Relaxed);
             }
         }
+
+        // Clean up child process
+        let _ = child.kill();
     });
 }
 
@@ -280,6 +322,10 @@ fn check_value_for_workspace_id(v: &Value) -> Option<usize> {
 }
 
 pub fn switch_to_workspace(id: usize) {
+    if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+        return;
+    }
+
     let _ = Command::new("lwm")
         .args(["workspace", &id.to_string()])
         .creation_flags(CREATE_NO_WINDOW)
