@@ -9,7 +9,9 @@ use crate::ipc::{
 use crate::state::get_state;
 
 use std::mem::zeroed;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::os::windows::process::CommandExt;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -27,10 +29,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, IsWindowVisible, LoadCursorW, PostQuitMessage, RegisterClassExW, SetCursor,
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu,
     TranslateMessage, GA_ROOT, IDC_ARROW, IDC_HAND, LWA_COLORKEY, MF_STRING, MSG, SWP_NOACTIVATE,
-    SW_HIDE, SW_SHOWNA, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    SW_HIDE, SW_SHOWNA, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_LBUTTONUP, WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
+
+// --- Win32 Direct FFI ---
+
+type HandlerRoutine = unsafe extern "system" fn(u32) -> BOOL;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn SetErrorMode(u_mode: u32) -> u32;
+    fn SetConsoleCtrlHandler(handler_routine: Option<HandlerRoutine>, add: BOOL) -> BOOL;
+}
 
 #[link(name = "user32")]
 extern "system" {
@@ -42,6 +54,29 @@ extern "system" {
     fn SHQueryUserNotificationState(pquns: *mut i32) -> i32;
 }
 
+// System error mode flags (suppresses 0xc0000142 and crash dialogs)
+const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+
+// Console shutdown control events
+const CTRL_CLOSE_EVENT: u32 = 2;
+const CTRL_LOGOFF_EVENT: u32 = 5;
+const CTRL_SHUTDOWN_EVENT: u32 = 6;
+
+// Global shutdown flag accessible across modules
+pub static IS_SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
+    match ctrl_type {
+        CTRL_SHUTDOWN_EVENT | CTRL_LOGOFF_EVENT | CTRL_CLOSE_EVENT => {
+            IS_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+            BOOL(1)
+        }
+        _ => BOOL(0),
+    }
+}
+
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 const VK_LBUTTON: i32 = 0x01;
 
 // Notification states indicating exclusive fullscreen games / presentations
@@ -70,6 +105,24 @@ const COLOR_TEXT_EMPTY: COLORREF = COLORREF(0x00E0E0E0);       // Legible gray
 static BTN_SIZE: AtomicIsize = AtomicIsize::new(40);
 static HOVERED_INDEX: AtomicIsize = AtomicIsize::new(-1);
 
+pub fn execute_lwm(args: &[&str]) -> Result<String, ()> {
+    if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+        return Err(());
+    }
+
+    let result = Command::new("lwm")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        _ => Err(()),
+    }
+}
+
 /// Non-blocking 60 FPS tracker: inspects cursor coordinates directly without Windows hooks
 fn start_mouse_tracker(hwnd: HWND) {
     let hwnd_raw = hwnd.0 as usize;
@@ -79,7 +132,9 @@ fn start_mouse_tracker(hwnd: HWND) {
         let mut was_pressed = false;
 
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS polling
+            if IS_SHUTTING_DOWN.load(Ordering::Relaxed) {
+                break;
+            }
 
             if !unsafe { IsWindowVisible(hwnd).as_bool() } {
                 if HOVERED_INDEX.swap(-1, Ordering::Relaxed) != -1 {
@@ -87,16 +142,19 @@ fn start_mouse_tracker(hwnd: HWND) {
                         let _ = InvalidateRect(hwnd, None, BOOL(0));
                     }
                 }
+                std::thread::sleep(std::time::Duration::from_millis(16));
                 continue;
             }
 
             let mut win_rect = RECT::default();
             if unsafe { GetWindowRect(hwnd, &mut win_rect) }.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(16));
                 continue;
             }
 
             let mut pt = POINT::default();
             if unsafe { GetCursorPos(&mut pt) }.is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(16));
                 continue;
             }
 
@@ -156,6 +214,8 @@ fn start_mouse_tracker(hwnd: HWND) {
                 }
             }
             was_pressed = is_pressed;
+
+            std::thread::sleep(std::time::Duration::from_millis(16));
         }
     });
 }
@@ -201,7 +261,6 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
 
         if root_fg != our_hwnd && root_fg != taskbar && root_fg != desktop && root_fg != shell {
             if !IsIconic(root_fg).as_bool() && IsWindowVisible(root_fg).as_bool() {
-                // If the foreground window belongs to explorer (tray, desktop, flyouts), it's not a fullscreen app
                 let mut shell_pid: u32 = 0;
                 let mut fg_pid: u32 = 0;
                 GetWindowThreadProcessId(taskbar, Some(&mut shell_pid));
@@ -212,7 +271,6 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
                     let len = GetClassNameW(root_fg, &mut class_buf);
                     let class_name = String::from_utf16_lossy(&class_buf[..len as usize]);
 
-                    // Exclude Windows Shell / UWP flyouts (Start menu, Search, Quick Settings, etc.)
                     let is_shell_ui = class_name.starts_with("Windows.UI.")
                         || class_name.starts_with("Xaml")
                         || class_name == "Progman"
@@ -231,7 +289,6 @@ pub unsafe fn is_taskbar_visible(our_hwnd: HWND) -> bool {
                         if GetMonitorInfoW(hmon, &mut mi).as_bool() {
                             let mut fg_rect = RECT::default();
                             if GetWindowRect(root_fg, &mut fg_rect).is_ok() {
-                                // A true fullscreen window covers the entire monitor rect
                                 if fg_rect.left <= mi.rcMonitor.left
                                     && fg_rect.top <= mi.rcMonitor.top
                                     && fg_rect.right >= mi.rcMonitor.right
@@ -257,6 +314,21 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_QUERYENDSESSION => {
+            IS_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+            LRESULT(1)
+        }
+
+        WM_ENDSESSION => {
+            IS_SHUTTING_DOWN.store(true, Ordering::SeqCst);
+            if wparam.0 != 0 {
+                unsafe {
+                    PostQuitMessage(0);
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_ERASEBKGND => LRESULT(1),
 
         WM_SETCURSOR => {
@@ -567,6 +639,12 @@ unsafe fn dock_to_taskbar(hwnd: HWND) {
 
 fn main() {
     unsafe {
+        // Prevent Windows from popping up hard error boxes (0xc0000142)
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+
+        // Catch shutdown events even when docked into the taskbar
+        let _ = SetConsoleCtrlHandler(Some(console_ctrl_handler), BOOL(1));
+
         let instance = GetModuleHandleW(None).unwrap();
 
         let class_name = w!("RAIL_WINDOW");
